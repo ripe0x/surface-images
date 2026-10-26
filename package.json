@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "arweave": "2.1.0",
+    "@ardrive/turbo-sdk": "^2.1.2",
+    "@dha-team/arbundles": "^1.1.0",
     "playwright": "1.49.0",
     "sharp": "^0.35.3",
     "viem": "^2.21.0"

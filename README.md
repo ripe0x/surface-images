@@ -92,18 +92,29 @@ A deploy returns the Machine to the size in `fly.toml`.
 
 ## Archive to Arweave
 
-Fund a dedicated Arweave wallet with only what the upload needs (about
-0.01 AR per 700 KB PNG). Pass its key from your secret store at run time;
-never write it to a file:
+Uploads go through [ArDrive Turbo](https://docs.ar.io/build/upload/turbo-credits/),
+paid in ETH on Ethereum mainnet. One dedicated Ethereum key pays for credits
+and signs the uploads; fund it with a few dollars of ETH. Pass the key from
+your secret store at run time; never write it to a file.
 
 ```bash
-ARWEAVE_JWK="$(<command that prints the wallet JWK>)" ARWEAVE_ADDRESS=<wallet address> IMAGE_URL=https://<host> COLLECTION=0x... CHAIN_ID=11155111 OUT_DIR=./archive PUBLISH_FILE=./archive/publish.json MAX_UPLOAD_WINSTON=50000000000 npm run archive -- 1 100
+export ETH_PRIVATE_KEY="$(<command that prints the key>)" ETH_ADDRESS=<its address>
+npm run archive -- balance
+npm run archive -- top-up 0.002
 ```
 
-Each run moves every token one step: sign, upload, verify. Re-run until
-every token reports `verified` (Arweave confirmation takes about 40 minutes).
-A signature is saved before it is sent, so re-runs and crashes never pay twice.
-Keep `OUT_DIR` until the publish is confirmed.
+`top-up` shows the credits the ETH buys and asks before sending; credits are
+not refundable. About 45 PNGs of 750 KB per 0.001 ETH at October 2026 rates.
+
+```bash
+IMAGE_URL=https://<host> COLLECTION=0x... CHAIN_ID=11155111 OUT_DIR=./archive PUBLISH_FILE=./archive/publish.json npm run archive -- 1 100
+```
+
+Each run moves every token one step: sign, upload, verify on arweave.net.
+Re-run until every token reports `verified`. Signing is local and
+deterministic and the signed upload is saved before it is sent, so re-runs
+and crashes never pay twice (Turbo does not charge for a duplicate). Keep
+`OUT_DIR` until the publish is confirmed.
 
 ## Publish
 
