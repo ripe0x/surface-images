@@ -186,7 +186,7 @@ async function main(): Promise<void> {
     if (!stopping) timer = setTimeout(() => { pass = loop() }, config.pollMs)
   }
 
-  const server = createImageServer(cache, config.placeholder, () => ({ ...state, rendered: cache.size(), latestMinted: String(latestMinted) }), () => latestMinted)
+  const server = createImageServer(cache, config.placeholder, () => ({ ...state, collection: config.collection, rendered: cache.size(), latestMinted: String(latestMinted) }), () => latestMinted)
   await new Promise<void>((resolve) => server.listen(config.port, "0.0.0.0", resolve))
   console.log(`[surface-images] serving ${cache.size()} cached images on :${(server.address() as { port: number }).port}`)
   pass = loop()

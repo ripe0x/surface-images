@@ -47,7 +47,7 @@ CHAIN=sepolia COLLECTION=0x... CACHE_DIR=./cache npm start
 | `PLACEHOLDER_URL` | built-in "Rendering…" SVG | https redirect for minted tokens not yet rendered |
 | `PORT` | `8080` | HTTP port |
 
-`GET /health` reports `minted`, `rendered`, `lastPassAt` and `lastError`.
+`GET /health` reports `collection`, `minted`, `rendered`, `lastPassAt` and `lastError`.
 
 ## Rush behavior
 
