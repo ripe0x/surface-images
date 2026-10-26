@@ -60,6 +60,8 @@ export function openImageCache(dir: string): ImageCache {
 export function createImageServer(cache: ImageCache, placeholder: string | undefined, status: () => object, pendingUpTo: () => bigint = () => 0n): Server {
   return createServer((request, response) => {
     const path = request.url?.split("?")[0] ?? ""
+    // Public images: any page may fetch them (e.g. to archive them from a browser).
+    response.setHeader("access-control-allow-origin", "*")
     if (request.method !== "GET" && request.method !== "HEAD") return void response.writeHead(405).end()
     if (path === "/health") {
       response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" })

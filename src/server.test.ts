@@ -22,6 +22,7 @@ test("serves cached PNGs as immutable, minted-but-pending tokens as a pending im
       assert.equal(hit.status, 200)
       assert.equal(hit.headers.get("content-type"), "image/png")
       assert.match(hit.headers.get("cache-control")!, /immutable/)
+      assert.equal(hit.headers.get("access-control-allow-origin"), "*")
       assert.equal(Buffer.from(await hit.arrayBuffer()).toString(), "png-7")
       const pending = await fetch(`${base}/8.png`, { redirect: "manual" })
       assert.equal(pending.headers.get("cache-control"), "no-cache")
