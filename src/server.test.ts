@@ -10,12 +10,12 @@ async function listen(server: ReturnType<typeof createImageServer>): Promise<str
   return `http://127.0.0.1:${(server.address() as { port: number }).port}`
 }
 
-test("serves cached PNGs as immutable and everything else as a short-lived placeholder", async () => {
+test("serves cached PNGs as immutable, minted-but-pending tokens as a pending image, unminted ids as 404", async () => {
   const dir = mkdtempSync(join(tmpdir(), "capture-"))
   writeFileSync(join(dir, "7.png"), Buffer.from("png-7"))
   const cache = openImageCache(dir)
-  for (const [placeholder, pending] of [["https://arweave.net/cover", 302], [undefined, 404]] as const) {
-    const server = createImageServer(cache, placeholder, () => ({ minted: "9" }))
+  for (const placeholder of ["https://arweave.net/cover", undefined]) {
+    const server = createImageServer(cache, placeholder, () => ({ minted: "9" }), () => 9n)
     const base = await listen(server)
     try {
       const hit = await fetch(`${base}/7.png`)
@@ -23,13 +23,19 @@ test("serves cached PNGs as immutable and everything else as a short-lived place
       assert.equal(hit.headers.get("content-type"), "image/png")
       assert.match(hit.headers.get("cache-control")!, /immutable/)
       assert.equal(Buffer.from(await hit.arrayBuffer()).toString(), "png-7")
-      const miss = await fetch(`${base}/8.png`, { redirect: "manual" })
-      assert.equal(miss.status, pending)
-      assert.doesNotMatch(miss.headers.get("cache-control")!, /immutable/)
-      if (placeholder) assert.equal(miss.headers.get("location"), placeholder)
+      const pending = await fetch(`${base}/8.png`, { redirect: "manual" })
+      assert.equal(pending.headers.get("cache-control"), "no-cache")
+      if (placeholder) {
+        assert.equal(pending.status, 302)
+        assert.equal(pending.headers.get("location"), placeholder)
+      } else {
+        assert.equal(pending.status, 200)
+        assert.equal(pending.headers.get("content-type"), "image/svg+xml")
+        assert.match(await pending.text(), /Rendering/)
+      }
+      assert.equal((await fetch(`${base}/10.png`, { redirect: "manual" })).status, 404, "unminted")
       for (const path of ["/07.png", "/0.png", "/7.jpg", "/7.png/x", "/7.png.tmp"]) {
-        const bad = await fetch(`${base}${path}`, { redirect: "manual" })
-        assert.equal(bad.status, 404, path)
+        assert.equal((await fetch(`${base}${path}`, { redirect: "manual" })).status, 404, path)
       }
       assert.deepEqual(await (await fetch(`${base}/health`)).json(), { ok: true, minted: "9" })
       assert.equal((await fetch(`${base}/7.png`, { method: "POST" })).status, 405)
@@ -65,7 +71,9 @@ test("render loop renders each confirmed uncached token once, in order, and retr
       return Buffer.from(`png-${id}`)
     },
   }
-  assert.deepEqual(await renderMissing(deps), { minted: 4n, rendered: 2, failed: 1 })
+  let latest = 0n
+  assert.deepEqual(await renderMissing(deps, () => false, 1, (n) => { latest = n }), { minted: 4n, rendered: 2, failed: 1 })
+  assert.equal(latest, 4n, "latest minted falls back to the confirmed count")
   assert.deepEqual(rendered, ["1", "3"])
   failFour = false
   assert.deepEqual(await renderMissing(deps), { minted: 4n, rendered: 1, failed: 0 })
@@ -101,7 +109,7 @@ test("a burst of requests during rendering is served without errors", async () =
   const cache = openImageCache(dir)
   const png = Buffer.alloc(700_000, 1)
   for (let id = 1; id <= 50; id++) cache.put(String(id), png)
-  const server = createImageServer(cache, "https://arweave.net/cover", () => ({}))
+  const server = createImageServer(cache, "https://arweave.net/cover", () => ({}), () => 100n)
   const base = await listen(server)
   try {
     const statuses = await Promise.all(Array.from({ length: 1000 }, (_, i) =>

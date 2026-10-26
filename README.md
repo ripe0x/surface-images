@@ -44,7 +44,7 @@ CHAIN=sepolia COLLECTION=0x... CACHE_DIR=./cache npm start
 | `POLL_SECONDS` | `30` | how often new mints are checked |
 | `IMAGE_SIZE` | `2048` | square output size in pixels |
 | `RENDER_CONCURRENCY` | CPU count | browsers rendering in parallel |
-| `PLACEHOLDER_URL` | none | https redirect for tokens not yet rendered (404 otherwise) |
+| `PLACEHOLDER_URL` | built-in "Rendering…" SVG | https redirect for minted tokens not yet rendered |
 | `PORT` | `8080` | HTTP port |
 
 `GET /health` reports `minted`, `rendered`, `lastPassAt` and `lastError`.
@@ -52,16 +52,21 @@ CHAIN=sepolia COLLECTION=0x... CACHE_DIR=./cache npm start
 ## Rush behavior
 
 Requests only read PNGs from memory, so traffic never triggers rendering or
-RPC calls. Rendered PNGs are cached for a year (a still never changes);
-pending ones get a 60-second placeholder or a 30-second 404.
+RPC calls. Rendered PNGs are cached for a year (a still never changes). A
+token that is minted but not rendered yet (still confirming, or queued) gets
+a "Rendering…" image with `no-cache`, so viewers pick up the real image as
+soon as it exists; an id that is not minted at all returns 404.
 
 Without a GPU, WebGL runs in software, and each browser has one GPU process,
 so the service runs one browser per CPU. Measured on Fly.io for a 2048 × 2048
 WebGL work: 9 s per token on one dedicated CPU, about 1.3 s on eight. Scale up
 for a mint window and back down afterwards.
 
-The 12-block confirmation is the reorg assumption: a deeper reorganization
-that changed a seed needs that token's file deleted from `CACHE_DIR`.
+`CONFIRMATIONS` is the reorg assumption: a token renders once its mint is
+that deep, and the still is then cached forever. A deeper reorganization that
+changed a seed needs that token's file deleted from `CACHE_DIR`. Fewer
+confirmations show images sooner (3 blocks is about 36 seconds on Ethereum);
+12 is the conservative default.
 
 ## Deploy to Fly.io
 

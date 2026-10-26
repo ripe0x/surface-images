@@ -3,8 +3,9 @@
  * token's still, rendered from its own onchain HTML in "capture" context. A
  * background loop renders new confirmed mints into CACHE_DIR, one Chromium
  * per CPU; requests only read memory, so a mint rush never renders, calls
- * the chain or touches the disk per request. Until a token is rendered it
- * redirects to PLACEHOLDER_URL (or 404s). No keys or database are involved.
+ * the chain or touches the disk per request. A minted token that is not
+ * rendered yet gets a short-lived "rendering" image (or a redirect to
+ * PLACEHOLDER_URL); an unminted id 404s. No keys or database are involved.
  */
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { createServer, type Server } from "node:http"
@@ -23,6 +24,9 @@ const surfaceAbi = parseAbi([
 const PNG_PATH = /^\/([1-9]\d{0,9})\.png$/
 // A still is a pure function of the confirmed token, so it never changes.
 const IMMUTABLE = "public, max-age=31536000, immutable"
+// Shown while a minted token waits for confirmations and its render. Never
+// cached for long, so viewers pick up the real image as soon as it exists.
+const PENDING_SVG = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" fill="#141414"/><text x="256" y="266" fill="#8a8a8f" font-family="system-ui, sans-serif" font-size="22" text-anchor="middle">Rendering…</text></svg>')
 
 export interface ImageCache {
   get(id: string): Buffer | undefined
@@ -52,7 +56,8 @@ export function openImageCache(dir: string): ImageCache {
   }
 }
 
-export function createImageServer(cache: ImageCache, placeholder: string | undefined, status: () => object): Server {
+/** `pendingUpTo` is the latest (unconfirmed) minted count: ids at or below it are minted. */
+export function createImageServer(cache: ImageCache, placeholder: string | undefined, status: () => object, pendingUpTo: () => bigint = () => 0n): Server {
   return createServer((request, response) => {
     const path = request.url?.split("?")[0] ?? ""
     if (request.method !== "GET" && request.method !== "HEAD") return void response.writeHead(405).end()
@@ -66,23 +71,27 @@ export function createImageServer(cache: ImageCache, placeholder: string | undef
       response.writeHead(200, { "content-type": "image/png", "content-length": png.length, "cache-control": IMMUTABLE })
       return void response.end(request.method === "HEAD" ? undefined : png)
     }
-    // Pending or unminted: short cache so the real image replaces it soon.
-    if (id && placeholder) return void response.writeHead(302, { location: placeholder, "cache-control": "public, max-age=60" }).end()
-    response.writeHead(404, { "cache-control": "public, max-age=30" }).end()
+    if (id && BigInt(id) <= pendingUpTo()) {
+      if (placeholder) return void response.writeHead(302, { location: placeholder, "cache-control": "no-cache" }).end()
+      response.writeHead(200, { "content-type": "image/svg+xml", "content-length": PENDING_SVG.length, "cache-control": "no-cache" })
+      return void response.end(request.method === "HEAD" ? undefined : PENDING_SVG)
+    }
+    response.writeHead(404, { "cache-control": "public, max-age=10" }).end()
   })
 }
 
 export interface RenderLoopDeps {
-  /** Confirmed minted count and a capture-document reader pinned to that same block. */
-  snapshot(): Promise<{ minted: bigint; documentOf(id: bigint): Promise<string> }>
+  /** Confirmed minted count, a capture-document reader pinned to that block, and the latest (unconfirmed) minted count. */
+  snapshot(): Promise<{ minted: bigint; latestMinted?: bigint; documentOf(id: bigint): Promise<string> }>
   /** `slot` is the worker (0..concurrency-1); each owns one browser. */
   render(html: string, slot: number): Promise<Buffer>
   cache: ImageCache
 }
 
 /** Render every confirmed, uncached token, lowest id first, `concurrency` at a time. A failed token is retried next pass. */
-export async function renderMissing(deps: RenderLoopDeps, stopping: () => boolean = () => false, concurrency = 1): Promise<{ minted: bigint; rendered: number; failed: number }> {
-  const { minted, documentOf } = await deps.snapshot()
+export async function renderMissing(deps: RenderLoopDeps, stopping: () => boolean = () => false, concurrency = 1, onSnapshot: (latestMinted: bigint) => void = () => {}): Promise<{ minted: bigint; rendered: number; failed: number }> {
+  const { minted, latestMinted, documentOf } = await deps.snapshot()
+  onSnapshot(latestMinted ?? minted)
   const queue: bigint[] = []
   for (let id = 1n; id <= minted; id++) if (!deps.cache.has(String(id))) queue.push(id)
   let rendered = 0
@@ -135,10 +144,14 @@ async function main(): Promise<void> {
   const deps: RenderLoopDeps = {
     cache,
     async snapshot() {
-      const blockNumber = (await client.getBlockNumber()) - config.confirmations + 1n
-      const [, minted] = await client.readContract({ address: config.collection, abi: surfaceAbi, functionName: "config", blockNumber })
+      const latest = await client.getBlockNumber()
+      const blockNumber = latest - config.confirmations + 1n
+      const [[, minted], [, latestMinted]] = await Promise.all([
+        client.readContract({ address: config.collection, abi: surfaceAbi, functionName: "config", blockNumber }),
+        client.readContract({ address: config.collection, abi: surfaceAbi, functionName: "config", blockNumber: latest }),
+      ])
       return {
-        minted,
+        minted, latestMinted,
         documentOf: async (id) => captureDocument(await client.readContract({ address: config.collection, abi: surfaceAbi, functionName: "tokenURI", args: [id], blockNumber })),
       }
     },
@@ -155,12 +168,13 @@ async function main(): Promise<void> {
     },
   }
 
+  let latestMinted = 0n
   let stopping = false
   let timer: ReturnType<typeof setTimeout> | undefined
   let pass: Promise<void> | undefined
   async function loop(): Promise<void> {
     try {
-      const result = await renderMissing(deps, () => stopping, config.concurrency)
+      const result = await renderMissing(deps, () => stopping, config.concurrency, (n) => { latestMinted = n })
       Object.assign(state, { minted: String(result.minted), lastPassAt: new Date().toISOString(),
         lastError: result.failed ? `${result.failed} token(s) failed to render; retrying` : null })
     } catch (error) {
@@ -170,7 +184,7 @@ async function main(): Promise<void> {
     if (!stopping) timer = setTimeout(() => { pass = loop() }, config.pollMs)
   }
 
-  const server = createImageServer(cache, config.placeholder, () => ({ ...state, rendered: cache.size() }))
+  const server = createImageServer(cache, config.placeholder, () => ({ ...state, rendered: cache.size(), latestMinted: String(latestMinted) }), () => latestMinted)
   await new Promise<void>((resolve) => server.listen(config.port, "0.0.0.0", resolve))
   console.log(`[surface-images] serving ${cache.size()} cached images on :${(server.address() as { port: number }).port}`)
   pass = loop()
