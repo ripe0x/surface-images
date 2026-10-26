@@ -1,0 +1,26 @@
+{
+  "name": "surface-images",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Serve PND Surface token stills rendered from their onchain HTML, and archive them to Arweave.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types --no-warnings src/server.ts",
+    "archive": "node --experimental-strip-types --no-warnings src/archive.ts",
+    "test": "node --experimental-strip-types --no-warnings --test src/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "arweave": "2.1.0",
+    "playwright": "1.49.0",
+    "sharp": "^0.35.3",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

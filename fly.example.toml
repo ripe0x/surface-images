@@ -1,0 +1,46 @@
+# Copy to fly.toml (gitignored) and fill in the app, chain and collection.
+app = "<your-app>"
+primary_region = "ewr"
+kill_signal = "SIGTERM"
+kill_timeout = 60
+
+[env]
+  CHAIN = "sepolia"
+  COLLECTION = "0x..."
+  CACHE_DIR = "/data/images"
+  CONFIRMATIONS = "12"
+  # Optional: where a not-yet-rendered token redirects (https only).
+  # PLACEHOLDER_URL = "https://arweave.net/<cover-id>"
+
+# Rendered PNGs survive restarts and deploys, so there is no re-render storm.
+# Create once: fly volumes create images --size 1 --region ewr
+[mounts]
+  source = "images"
+  destination = "/data"
+
+# Always on: a stopped Machine would cold-start Chromium during a mint.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 500
+    hard_limit = 2000
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "30s"
+
+# Dedicated CPU: shared CPUs are throttled under sustained rendering. Scale to
+# performance-8x for a mint window (fly scale vm performance-8x), then back.
+[[vm]]
+  cpu_kind = "performance"
+  cpus = 1
+  memory = "2gb"
