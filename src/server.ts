@@ -1,27 +1,35 @@
 /**
- * Image service for a PND Surface collection. GET /<id>.png returns a minted
- * token's still, rendered from its own onchain HTML in "capture" context. A
- * background loop renders new confirmed mints into CACHE_DIR, one Chromium
- * per CPU; requests only read memory, so a mint rush never renders, calls
- * the chain or touches the disk per request. A minted token that is not
- * rendered yet gets a short-lived "rendering" image (or a redirect to
- * PLACEHOLDER_URL); an unminted id 404s. No keys or database are involved.
+ * Image service for PND Surface (v2) collections. GET /<collection>/<id>.png
+ * returns a minted token's still, rendered from its own onchain HTML in
+ * "capture" context. Collections are found, not configured: every collection
+ * the FACTORY created whose renderer is RENDERER is watched from the block its
+ * RendererSet log confirms, so a new deploy is picked up without a restart. A
+ * background loop renders new confirmed mints into CACHE_DIR, one Chromium per
+ * CPU; requests only read memory, so a mint rush never renders, calls the
+ * chain or touches the disk per request. A minted token that is not rendered
+ * yet gets a short-lived "rendering" image (or a redirect to PLACEHOLDER_URL);
+ * anything else 404s. No keys or database are involved.
  */
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { createServer, type Server } from "node:http"
 import { availableParallelism } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { createPublicClient, http, parseAbi, type Address } from "viem"
+import { createPublicClient, getAddress, http, parseAbi, parseAbiItem, type Address } from "viem"
 import { mainnet, sepolia } from "viem/chains"
 import { captureDocument } from "./document.ts"
 import { launchBrowser, renderDocument } from "./render.ts"
 
 const surfaceAbi = parseAbi([
-  "function config() view returns ((uint256 supplyCap, uint16 royaltyBps, address royaltyReceiver, address renderer, bool rendererLocked, bool supplyLocked) cfg, uint256 minted)",
+  "function config() view returns (address renderer, address minter, uint256 supplyCap, uint16 royaltyBps, address royaltyReceiver, uint256 minted)",
   "function tokenURI(uint256 tokenId) view returns (string)",
 ])
-const PNG_PATH = /^\/([1-9]\d{0,9})\.png$/
+const factoryAbi = parseAbi(["function isInstance(address) view returns (bool)"])
+// Surface emits it at initialize and on every setRenderer.
+const rendererSet = parseAbiItem("event RendererSet(address indexed renderer)")
+const PNG_PATH = /^\/(0x[\da-fA-F]{40})\/([1-9]\d{0,9})\.png$/
+// Blocks per eth_getLogs while catching up.
+const LOG_CHUNK = 10_000n
 // A still is a pure function of the confirmed token, so it never changes.
 const IMMUTABLE = "public, max-age=31536000, immutable"
 // Shown while a minted token waits for confirmations and its render. Never
@@ -56,8 +64,11 @@ export function openImageCache(dir: string): ImageCache {
   }
 }
 
-/** `pendingUpTo` is the latest (unconfirmed) minted count: ids at or below it are minted. */
-export function createImageServer(cache: ImageCache, placeholder: string | undefined, status: () => object, pendingUpTo: () => bigint = () => 0n): Server {
+/** One watched collection. `latestMinted` is the unconfirmed minted count: ids at or below it are minted. */
+export interface Watched { cache: ImageCache; minted: bigint; latestMinted: bigint }
+
+/** `watched` is keyed by lowercase collection address. */
+export function createImageServer(watched: Map<string, Watched>, placeholder: string | undefined, status: () => object): Server {
   return createServer((request, response) => {
     const path = request.url?.split("?")[0] ?? ""
     // Public images: any page may fetch them (e.g. to archive them from a browser).
@@ -67,13 +78,14 @@ export function createImageServer(cache: ImageCache, placeholder: string | undef
       response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" })
       return void response.end(JSON.stringify({ ok: true, ...status() }))
     }
-    const id = PNG_PATH.exec(path)?.[1]
-    const png = id ? cache.get(id) : undefined
+    const [, collection, id] = PNG_PATH.exec(path) ?? []
+    const entry = collection ? watched.get(collection.toLowerCase()) : undefined
+    const png = entry?.cache.get(id)
     if (png) {
       response.writeHead(200, { "content-type": "image/png", "content-length": png.length, "cache-control": IMMUTABLE })
       return void response.end(request.method === "HEAD" ? undefined : png)
     }
-    if (id && BigInt(id) <= pendingUpTo()) {
+    if (entry && BigInt(id) <= entry.latestMinted) {
       if (placeholder) return void response.writeHead(302, { location: placeholder, "cache-control": "no-cache" }).end()
       response.writeHead(200, { "content-type": "image/svg+xml", "content-length": PENDING_SVG.length, "cache-control": "no-cache" })
       return void response.end(request.method === "HEAD" ? undefined : PENDING_SVG)
@@ -113,11 +125,41 @@ export async function renderMissing(deps: RenderLoopDeps, stopping: () => boolea
   return { minted, rendered, failed }
 }
 
+export interface DiscoveryState { scannedTo: bigint; collections: Address[] }
+
+export interface DiscoveryDeps {
+  /** Emitters of RendererSet(RENDERER) in [from, to]. */
+  logs(from: bigint, to: bigint): Promise<Address[]>
+  /** True if FACTORY created it. Anyone can emit a RendererSet log; only factory instances are watched. */
+  isInstance(address: Address): Promise<boolean>
+}
+
+/** Scan (scannedTo, toBlock] for collections pointed at the renderer, appending new ones to `state.collections` as found. Advances chunk by chunk, so a failure resumes where it stopped and loses nothing. */
+export async function discover(state: DiscoveryState, toBlock: bigint, deps: DiscoveryDeps): Promise<void> {
+  const known = new Set(state.collections.map((a) => a.toLowerCase()))
+  while (state.scannedTo < toBlock) {
+    const from = state.scannedTo + 1n
+    const to = from + LOG_CHUNK - 1n < toBlock ? from + LOG_CHUNK - 1n : toBlock
+    for (const address of await deps.logs(from, to)) {
+      if (known.has(address.toLowerCase())) continue
+      known.add(address.toLowerCase())
+      if (await deps.isInstance(address)) state.collections.push(getAddress(address))
+    }
+    state.scannedTo = to
+  }
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const chain = env.CHAIN === "mainnet" ? mainnet : env.CHAIN === "sepolia" ? sepolia : undefined
   if (!chain) throw new Error("CHAIN must be mainnet or sepolia")
-  const collection = env.COLLECTION
-  if (!collection || !/^0x[\da-fA-F]{40}$/.test(collection)) throw new Error("invalid COLLECTION")
+  const address = (name: string) => {
+    const value = env[name]
+    if (!value || !/^0x[\da-fA-F]{40}$/.test(value)) throw new Error(`invalid ${name}`)
+    return getAddress(value)
+  }
+  const factory = address("FACTORY")
+  const renderer = address("RENDERER")
+  if (!/^\d+$/.test(env.FROM_BLOCK ?? "")) throw new Error("FROM_BLOCK required: the factory's deploy block")
   if (!env.CACHE_DIR) throw new Error("CACHE_DIR required")
   const integer = (name: string, fallback: number, min: number) => {
     const value = Number(env[name] ?? fallback)
@@ -127,7 +169,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const placeholder = env.PLACEHOLDER_URL || undefined
   if (placeholder && new URL(placeholder).protocol !== "https:") throw new Error("PLACEHOLDER_URL must be https")
   return {
-    chain, collection: collection as Address, placeholder, cacheDir: env.CACHE_DIR,
+    chain, factory, renderer, fromBlock: BigInt(env.FROM_BLOCK!), placeholder, cacheDir: env.CACHE_DIR,
     rpcUrl: env.RPC_URL || `https://${env.CHAIN}.gateway.tenderly.co`,
     confirmations: BigInt(integer("CONFIRMATIONS", 12, 1)),
     pollMs: integer("POLL_SECONDS", 30, 1) * 1000,
@@ -140,55 +182,95 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
 async function main(): Promise<void> {
   const config = loadConfig()
   const client = createPublicClient({ chain: config.chain, transport: http(config.rpcUrl) })
-  const cache = openImageCache(config.cacheDir)
-  const state = { minted: "0", lastError: null as string | null, lastPassAt: null as string | null }
+  const statePath = join(config.cacheDir, "collections.json")
+  mkdirSync(config.cacheDir, { recursive: true })
+  const saved = (() => { try { return JSON.parse(readFileSync(statePath, "utf8")) } catch { return undefined } })()
+  // A saved scan for another factory or renderer is ignored, never mixed in.
+  const discovery: DiscoveryState = saved?.factory === config.factory && saved?.renderer === config.renderer
+    ? { scannedTo: BigInt(saved.scannedTo), collections: saved.collections }
+    : { scannedTo: config.fromBlock - 1n, collections: [] }
+  const saveDiscovery = () => {
+    writeFileSync(`${statePath}.tmp`, JSON.stringify({ factory: config.factory, renderer: config.renderer, scannedTo: String(discovery.scannedTo), collections: discovery.collections }, null, 2))
+    renameSync(`${statePath}.tmp`, statePath)
+  }
+  const watched = new Map<string, Watched>()
+  const watch = (address: Address) => watched.set(address.toLowerCase(), { cache: openImageCache(join(config.cacheDir, address.toLowerCase())), minted: 0n, latestMinted: 0n })
+  discovery.collections.forEach(watch)
+
+  const state = { lastError: null as string | null, lastPassAt: null as string | null }
   const browsers: (Awaited<ReturnType<typeof launchBrowser>> | undefined)[] = []
-  const deps: RenderLoopDeps = {
-    cache,
-    async snapshot() {
-      const latest = await client.getBlockNumber()
-      const blockNumber = latest - config.confirmations + 1n
-      const [[, minted], [, latestMinted]] = await Promise.all([
-        client.readContract({ address: config.collection, abi: surfaceAbi, functionName: "config", blockNumber }),
-        client.readContract({ address: config.collection, abi: surfaceAbi, functionName: "config", blockNumber: latest }),
-      ])
-      return {
-        minted, latestMinted,
-        documentOf: async (id) => captureDocument(await client.readContract({ address: config.collection, abi: surfaceAbi, functionName: "tokenURI", args: [id], blockNumber })),
-      }
-    },
-    async render(html, slot) {
-      try {
-        const browser = browsers[slot] ??= await launchBrowser()
-        return await renderDocument(browser, html, config.size)
-      } catch (error) {
-        // A crashed Chromium is relaunched on the next token.
-        await browsers[slot]?.close().catch(() => {})
-        browsers[slot] = undefined
-        throw error
-      }
-    },
+  const render = async (html: string, slot: number) => {
+    try {
+      const browser = browsers[slot] ??= await launchBrowser()
+      return await renderDocument(browser, html, config.size)
+    } catch (error) {
+      // A crashed Chromium is relaunched on the next token.
+      await browsers[slot]?.close().catch(() => {})
+      browsers[slot] = undefined
+      throw error
+    }
+  }
+  const mintedAt = async (address: Address, blockNumber: bigint) => {
+    const [renderer, , , , , minted] = await client.readContract({ address, abi: surfaceAbi, functionName: "config", blockNumber })
+    // Only tokens our renderer draws are rendered; a collection that moved to another renderer keeps its cached stills.
+    return renderer === config.renderer ? minted : 0n
   }
 
-  let latestMinted = 0n
   let stopping = false
   let timer: ReturnType<typeof setTimeout> | undefined
   let pass: Promise<void> | undefined
   async function loop(): Promise<void> {
+    const errors: string[] = []
     try {
-      const result = await renderMissing(deps, () => stopping, config.concurrency, (n) => { latestMinted = n })
-      Object.assign(state, { minted: String(result.minted), lastPassAt: new Date().toISOString(),
-        lastError: result.failed ? `${result.failed} token(s) failed to render; retrying` : null })
+      const latest = await client.getBlockNumber()
+      const blockNumber = latest - config.confirmations + 1n
+      await discover(discovery, blockNumber, {
+        logs: async (fromBlock, toBlock) => (await client.getLogs({ event: rendererSet, args: { renderer: config.renderer }, fromBlock, toBlock })).map((log) => log.address),
+        isInstance: (address) => client.readContract({ address: config.factory, abi: factoryAbi, functionName: "isInstance", args: [address], blockNumber }),
+      }).finally(() => {
+        saveDiscovery()
+        for (const address of discovery.collections) {
+          if (watched.has(address.toLowerCase())) continue
+          console.log(`[surface-images] watching ${address}`)
+          watch(address)
+        }
+      })
+      for (const address of discovery.collections) {
+        if (stopping) break
+        const entry = watched.get(address.toLowerCase())!
+        try {
+          const result = await renderMissing({
+            cache: entry.cache,
+            render,
+            snapshot: async () => {
+              const [minted, latestMinted] = await Promise.all([mintedAt(address, blockNumber), mintedAt(address, latest)])
+              return { minted, latestMinted, documentOf: async (id) => captureDocument(await client.readContract({ address, abi: surfaceAbi, functionName: "tokenURI", args: [id], blockNumber })) }
+            },
+          }, () => stopping, config.concurrency, (n) => { entry.latestMinted = n })
+          entry.minted = result.minted
+          if (result.failed) errors.push(`${address}: ${result.failed} token(s) failed to render; retrying`)
+        } catch (error) {
+          errors.push(`${address}: ${error instanceof Error ? error.message.slice(0, 200) : "render pass failed"}`)
+        }
+      }
+      state.lastPassAt = new Date().toISOString()
     } catch (error) {
-      state.lastError = error instanceof Error ? error.message.slice(0, 200) : "render pass failed"
-      console.error(`[surface-images] ${state.lastError}`)
+      errors.push(error instanceof Error ? error.message.slice(0, 200) : "pass failed")
     }
+    state.lastError = errors.length ? errors.join("; ") : null
+    if (state.lastError) console.error(`[surface-images] ${state.lastError}`)
     if (!stopping) timer = setTimeout(() => { pass = loop() }, config.pollMs)
   }
 
-  const server = createImageServer(cache, config.placeholder, () => ({ ...state, collection: config.collection, rendered: cache.size(), latestMinted: String(latestMinted) }), () => latestMinted)
+  const server = createImageServer(watched, config.placeholder, () => ({
+    ...state, factory: config.factory, renderer: config.renderer, scannedTo: String(discovery.scannedTo),
+    collections: Object.fromEntries(discovery.collections.map((address) => {
+      const entry = watched.get(address.toLowerCase())!
+      return [address, { minted: String(entry.minted), latestMinted: String(entry.latestMinted), rendered: entry.cache.size() }]
+    })),
+  }))
   await new Promise<void>((resolve) => server.listen(config.port, "0.0.0.0", resolve))
-  console.log(`[surface-images] serving ${cache.size()} cached images on :${(server.address() as { port: number }).port}`)
+  console.log(`[surface-images] serving ${watched.size} collection(s) on :${(server.address() as { port: number }).port}`)
   pass = loop()
 
   for (const signal of ["SIGTERM", "SIGINT"] as const) {

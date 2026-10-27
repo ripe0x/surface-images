@@ -15,7 +15,7 @@
  *   ETH_PRIVATE_KEY  payer and signer, passed from a secret store at run time, never a file
  *   ETH_ADDRESS      that key's address, checked before anything runs
  *   ETH_RPC_URL      Ethereum mainnet RPC for top-ups (default https://mainnet.gateway.tenderly.co)
- *   IMAGE_URL        the image service, e.g. https://<app>.fly.dev (archive only)
+ *   IMAGE_URL        the collection on the image service, e.g. https://<app>.fly.dev/<collection> (archive only)
  *   COLLECTION       collection address (upload tag)
  *   CHAIN_ID         collection chain id (upload tag)
  *   OUT_DIR          local state: signed uploads and manifest.json

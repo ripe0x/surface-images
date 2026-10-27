@@ -1,27 +1,36 @@
 # surface-images
 
-Serves still images for a [PND](https://pnd.fyi) Surface collection right
+Serves still images for [PND](https://pnd.fyi) Surface collections right
 after each mint, then archives them to Arweave when you choose.
 
-1. **Serve.** `GET /<tokenId>.png` returns the token's PNG. A background loop
-   watches the collection at a confirmed block and renders each new token from
-   its own onchain HTML (`tokenURI` → `animation_url`), with the injected
-   render context switched from `"token"` to `"capture"`. There is no local
-   copy of the artwork, so the still is whatever the renderer serves.
-2. **Point tokens at it.** The collection owner sets the RenderAssets capture
-   template to `https://<host>/{id}.png`. Every token then has an image with
-   no per-mint transaction.
-3. **Archive.** `npm run archive -- <from> <to>` downloads the hosted PNGs,
-   uploads them to Arweave with native AR transactions and verifies the
-   confirmed bytes.
-4. **Publish.** The owner writes the verified `ar://` URIs with
+1. **Find collections.** The service watches one renderer. Every collection a
+   Surface factory creates with that renderer (at deploy or by a later
+   `setRenderer`) emits `RendererSet(renderer)`; the service picks it up from
+   the logs once the block is confirmed and starts watching it, with no
+   restart or configuration. A log from anything the factory did not create
+   is ignored.
+2. **Serve.** `GET /<collection>/<tokenId>.png` returns the token's PNG. A
+   background loop watches each collection at a confirmed block and renders
+   each new token from its own onchain HTML (`tokenURI` → `animation_url`),
+   with the injected render context switched from `"token"` to `"capture"`.
+   There is no local copy of the artwork, so the still is whatever the
+   renderer serves.
+3. **Point tokens at it.** The collection owner sets the RenderAssets capture
+   template to `https://<host>/<collection>/{id}.png`. Every token then has an
+   image with no per-mint transaction.
+4. **Archive.** `npm run archive -- <from> <to>` downloads the hosted PNGs,
+   uploads them to Arweave through ArDrive Turbo and verifies the bytes
+   arweave.net serves.
+5. **Publish.** The owner writes the verified `ar://` URIs with
    `RenderAssets.setCaptures`, then emits an ERC-4906 refresh.
 
-The service holds no keys and no database.
+The service holds no keys and no database. Its watch list and log cursor
+live in `CACHE_DIR/collections.json`.
 
 ## Requirements
 
-- A Surface collection whose renderer returns `animation_url` as an HTML
+- Surface v2 collections (the `config()` that returns the renderer and the
+  minted count) created by a factory with `isInstance(address)`, whose renderer returns `animation_url` as an HTML
   data URI containing exactly one injected `"context":"token"` (the Scripty
   renderer does), and draws its still into a canvas in `capture` context.
 - Node 22.6 or newer. Rendering uses headless Chromium via Playwright.
@@ -31,13 +40,15 @@ The service holds no keys and no database.
 ```bash
 npm install
 npx playwright install chromium
-CHAIN=sepolia COLLECTION=0x... CACHE_DIR=./cache npm start
+CHAIN=sepolia FACTORY=0x... RENDERER=0x... FROM_BLOCK=<factory deploy block> CACHE_DIR=./cache npm start
 ```
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CHAIN` | required | `mainnet` or `sepolia` |
-| `COLLECTION` | required | Surface collection address |
+| `FACTORY` | required | the Surface CloneFactory whose instances may be watched |
+| `RENDERER` | required | watch every factory collection using this renderer |
+| `FROM_BLOCK` | required | the factory's deploy block, where the first scan starts |
 | `CACHE_DIR` | required | where PNGs are stored |
 | `RPC_URL` | `https://<chain>.gateway.tenderly.co` | JSON-RPC endpoint |
 | `CONFIRMATIONS` | `12` | blocks before a mint is rendered |
@@ -47,7 +58,8 @@ CHAIN=sepolia COLLECTION=0x... CACHE_DIR=./cache npm start
 | `PLACEHOLDER_URL` | built-in "Rendering…" SVG | https redirect for minted tokens not yet rendered |
 | `PORT` | `8080` | HTTP port |
 
-`GET /health` reports `collection`, `minted`, `rendered`, `lastPassAt` and `lastError`.
+`GET /health` reports `scannedTo`, `lastPassAt`, `lastError`, and per
+collection `minted`, `latestMinted` and `rendered`.
 
 ## Rush behavior
 
@@ -62,9 +74,10 @@ so the service runs one browser per CPU. Measured on Fly.io for a 2048 × 2048
 WebGL work: 9 s per token on one dedicated CPU, about 1.3 s on eight. Scale up
 for a mint window and back down afterwards.
 
-`CONFIRMATIONS` is the reorg assumption: a token renders once its mint is
+`CONFIRMATIONS` is the reorg assumption: a collection is found and a token
+renders once its log or mint is
 that deep, and the still is then cached forever. A deeper reorganization that
-changed a seed needs that token's file deleted from `CACHE_DIR`. Fewer
+changed a seed needs that token's file deleted from `CACHE_DIR/<collection>`. Fewer
 confirmations show images sooner (3 blocks is about 36 seconds on Ethereum);
 12 is the conservative default.
 
@@ -107,7 +120,7 @@ npm run archive -- top-up 0.002
 not refundable. About 45 PNGs of 750 KB per 0.001 ETH at October 2026 rates.
 
 ```bash
-IMAGE_URL=https://<host> COLLECTION=0x... CHAIN_ID=11155111 OUT_DIR=./archive PUBLISH_FILE=./archive/publish.json npm run archive -- 1 100
+IMAGE_URL=https://<host>/<collection> COLLECTION=0x... CHAIN_ID=11155111 OUT_DIR=./archive PUBLISH_FILE=./archive/publish.json npm run archive -- 1 100
 ```
 
 Each run moves every token one step: sign, upload, verify on arweave.net.

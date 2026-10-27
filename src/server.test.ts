@@ -3,28 +3,31 @@ import { mkdtempSync, readdirSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
-import { createImageServer, loadConfig, openImageCache, renderMissing } from "./server.ts"
+import { createImageServer, discover, loadConfig, openImageCache, renderMissing, type Watched } from "./server.ts"
+
+const A = `0x${"ab".repeat(20)}`
+const watching = (cache: Watched["cache"], latestMinted: bigint) => new Map([[A, { cache, minted: latestMinted, latestMinted }]])
 
 async function listen(server: ReturnType<typeof createImageServer>): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
   return `http://127.0.0.1:${(server.address() as { port: number }).port}`
 }
 
-test("serves cached PNGs as immutable, minted-but-pending tokens as a pending image, unminted ids as 404", async () => {
+test("serves cached PNGs as immutable, minted-but-pending tokens as a pending image, unminted ids and unwatched collections as 404", async () => {
   const dir = mkdtempSync(join(tmpdir(), "capture-"))
   writeFileSync(join(dir, "7.png"), Buffer.from("png-7"))
   const cache = openImageCache(dir)
   for (const placeholder of ["https://arweave.net/cover", undefined]) {
-    const server = createImageServer(cache, placeholder, () => ({ minted: "9" }), () => 9n)
+    const server = createImageServer(watching(cache, 9n), placeholder, () => ({ minted: "9" }))
     const base = await listen(server)
     try {
-      const hit = await fetch(`${base}/7.png`)
+      const hit = await fetch(`${base}/${A}/7.png`)
       assert.equal(hit.status, 200)
       assert.equal(hit.headers.get("content-type"), "image/png")
       assert.match(hit.headers.get("cache-control")!, /immutable/)
       assert.equal(hit.headers.get("access-control-allow-origin"), "*")
       assert.equal(Buffer.from(await hit.arrayBuffer()).toString(), "png-7")
-      const pending = await fetch(`${base}/8.png`, { redirect: "manual" })
+      const pending = await fetch(`${base}/${A}/8.png`, { redirect: "manual" })
       assert.equal(pending.headers.get("cache-control"), "no-cache")
       if (placeholder) {
         assert.equal(pending.status, 302)
@@ -34,12 +37,13 @@ test("serves cached PNGs as immutable, minted-but-pending tokens as a pending im
         assert.equal(pending.headers.get("content-type"), "image/svg+xml")
         assert.match(await pending.text(), /Rendering/)
       }
-      assert.equal((await fetch(`${base}/10.png`, { redirect: "manual" })).status, 404, "unminted")
-      for (const path of ["/07.png", "/0.png", "/7.jpg", "/7.png/x", "/7.png.tmp"]) {
+      assert.equal((await fetch(`${base}/${A}/10.png`, { redirect: "manual" })).status, 404, "unminted")
+      assert.equal((await fetch(`${base}/${A.toUpperCase().replace("0X", "0x")}/7.png`)).status, 200, "address case does not matter")
+      for (const path of [`/${"cd".repeat(20)}/7.png`, `/0x${"cd".repeat(20)}/7.png`, "/7.png", `/${A}/07.png`, `/${A}/0.png`, `/${A}/7.jpg`, `/${A}/7.png/x`, `/${A}/7.png.tmp`]) {
         assert.equal((await fetch(`${base}${path}`, { redirect: "manual" })).status, 404, path)
       }
       assert.deepEqual(await (await fetch(`${base}/health`)).json(), { ok: true, minted: "9" })
-      assert.equal((await fetch(`${base}/7.png`, { method: "POST" })).status, 405)
+      assert.equal((await fetch(`${base}/${A}/7.png`, { method: "POST" })).status, 405)
     } finally {
       await new Promise((resolve) => server.close(resolve))
     }
@@ -110,11 +114,11 @@ test("a burst of requests during rendering is served without errors", async () =
   const cache = openImageCache(dir)
   const png = Buffer.alloc(700_000, 1)
   for (let id = 1; id <= 50; id++) cache.put(String(id), png)
-  const server = createImageServer(cache, "https://arweave.net/cover", () => ({}), () => 100n)
+  const server = createImageServer(watching(cache, 100n), "https://arweave.net/cover", () => ({}))
   const base = await listen(server)
   try {
     const statuses = await Promise.all(Array.from({ length: 1000 }, (_, i) =>
-      fetch(`${base}/${(i % 100) + 1}.png`, { redirect: "manual" }).then(async (r) => { await r.arrayBuffer(); return r.status })))
+      fetch(`${base}/${A}/${(i % 100) + 1}.png`, { redirect: "manual" }).then(async (r) => { await r.arrayBuffer(); return r.status })))
     assert.equal(statuses.filter((s) => s === 200).length, 500)
     assert.equal(statuses.filter((s) => s === 302).length, 500)
   } finally {
@@ -122,13 +126,44 @@ test("a burst of requests during rendering is served without errors", async () =
   }
 })
 
-test("config requires a chain, collection and cache dir and defaults to the Tenderly gateway", () => {
-  const base = { CHAIN: "sepolia", COLLECTION: `0x${"11".repeat(20)}`, CACHE_DIR: "/tmp/x" }
+test("discovery watches factory instances pointed at the renderer, once each, and resumes from the last chunk", async () => {
+  const real = `0x${"11".repeat(20)}`, fake = `0x${"22".repeat(20)}`, later = `0x${"33".repeat(20)}`
+  const emitted: Record<string, string[]> = { "100": [real, fake], "10150": [real], "25000": [later] }
+  const ranges: string[] = []
+  let failAt: bigint | undefined
+  const deps = {
+    logs: async (from: bigint, to: bigint) => {
+      if (failAt !== undefined && from >= failAt) throw new Error("rpc down")
+      ranges.push(`${from}-${to}`)
+      return Object.entries(emitted).filter(([block]) => BigInt(block) >= from && BigInt(block) <= to).flatMap(([, list]) => list) as `0x${string}`[]
+    },
+    isInstance: async (address: string) => address !== fake,
+  }
+  const state = { scannedTo: 99n, collections: [] as `0x${string}`[] }
+  failAt = 20_100n
+  await assert.rejects(discover(state, 30_000n, deps), /rpc down/)
+  assert.equal(state.scannedTo, 20_099n, "advanced through the chunks that succeeded")
+  assert.deepEqual(state.collections.map((a) => a.toLowerCase()), [real], "a collection found before the failure is kept")
+  failAt = undefined
+  ranges.length = 0
+  await discover(state, 30_000n, deps)
+  assert.deepEqual(ranges, ["20100-30000"], "resumes after the last good chunk")
+  assert.deepEqual(state.collections.map((a) => a.toLowerCase()), [real, later], "the impostor is skipped and a repeat RendererSet is not a new collection")
+  ranges.length = 0
+  await discover(state, 30_000n, deps)
+  assert.deepEqual(ranges, [], "nothing left to scan")
+  const fresh = { scannedTo: 99n, collections: [] as `0x${string}`[] }
+  await discover(fresh, 30_000n, deps)
+  assert.deepEqual(ranges, ["100-10099", "10100-20099", "20100-30000"], "chunks of 10,000 blocks")
+})
+
+test("config requires a chain, factory, renderer, start block and cache dir and defaults to the Tenderly gateway", () => {
+  const base = { CHAIN: "sepolia", FACTORY: `0x${"11".repeat(20)}`, RENDERER: `0x${"22".repeat(20)}`, FROM_BLOCK: "12002730", CACHE_DIR: "/tmp/x" }
   const config = loadConfig(base)
   assert.equal(config.rpcUrl, "https://sepolia.gateway.tenderly.co")
-  assert.deepEqual([config.size, config.confirmations, config.pollMs], [2048, 12n, 30_000])
+  assert.deepEqual([config.size, config.confirmations, config.pollMs, config.fromBlock], [2048, 12n, 30_000, 12002730n])
   assert.equal(loadConfig({ ...base, CHAIN: "mainnet" }).rpcUrl, "https://mainnet.gateway.tenderly.co")
-  for (const bad of [{ CHAIN: "base" }, { COLLECTION: "0x12" }, { CACHE_DIR: "" }, { CONFIRMATIONS: "0" }, { RENDER_CONCURRENCY: "0" }, { PLACEHOLDER_URL: "http://x/y.png" }]) {
+  for (const bad of [{ CHAIN: "base" }, { FACTORY: "0x12" }, { RENDERER: undefined }, { FROM_BLOCK: "" }, { FROM_BLOCK: "-1" }, { CACHE_DIR: "" }, { CONFIRMATIONS: "0" }, { RENDER_CONCURRENCY: "0" }, { PLACEHOLDER_URL: "http://x/y.png" }]) {
     assert.throws(() => loadConfig({ ...base, ...bad }), JSON.stringify(bad))
   }
 })

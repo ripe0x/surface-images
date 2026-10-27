@@ -1,4 +1,4 @@
-# Copy to fly.toml (gitignored) and fill in the app, chain and collection.
+# Copy to fly.toml (gitignored) and fill in the app, chain, factory and renderer.
 app = "<your-app>"
 primary_region = "ewr"
 kill_signal = "SIGTERM"
@@ -6,7 +6,10 @@ kill_timeout = 60
 
 [env]
   CHAIN = "sepolia"
-  COLLECTION = "0x..."
+  # Every collection FACTORY creates with RENDERER is found and served.
+  FACTORY = "0x..."
+  RENDERER = "0x..."
+  FROM_BLOCK = "<factory deploy block>"
   CACHE_DIR = "/data/images"
   CONFIRMATIONS = "12"
   # Optional: where a not-yet-rendered token redirects (https only).
